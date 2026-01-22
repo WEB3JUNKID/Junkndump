@@ -7,7 +7,7 @@ from flask import Flask
 from apscheduler.schedulers.background import BackgroundScheduler
 from telegram import Bot
 
-# --- LOGGING SETUP (Professional Standard) ---
+# --- LOGGING SETUP ---
 logging.basicConfig(
     level=logging.INFO,
     format='%(asctime)s - %(levelname)s - %(message)s'
@@ -22,7 +22,6 @@ class Config:
     BITQUERY_SECRET = os.getenv("BITQUERY_SECRET")
     TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
     CHAT_ID = os.getenv("CHAT_ID")
-    # Scan interval in minutes
     INTERVAL_MINUTES = 10 
 
 # --- THE RADAR CORE ---
@@ -33,11 +32,9 @@ class CryptoRadar:
         self.bot = Bot(token=Config.TELEGRAM_TOKEN)
 
     def _refresh_token(self):
-        """Fetches a new token only if the current one is expired or missing."""
         if self.token and datetime.now(timezone.utc) < self.token_expiry:
-            return # Token is still valid
-
-        logger.info("Refreshing Bitquery Token...")
+            return 
+        
         url = "https://oauth2.bitquery.io/oauth2/token"
         payload = {
             'grant_type': 'client_credentials',
@@ -48,21 +45,16 @@ class CryptoRadar:
         headers = {'Content-Type': 'application/x-www-form-urlencoded'}
         
         try:
-            # Note: The payload should be data, not json for x-www-form-urlencoded
             response = requests.post(url, headers=headers, data=payload)
             response.raise_for_status()
             data = response.json()
             self.token = data.get('access_token')
-            # Set expiry to 23 hours to be safe (usually 24h)
             self.token_expiry = datetime.now(timezone.utc) + timedelta(hours=23)
-            logger.info("Token refreshed successfully.")
+            logger.info("Bitquery token refreshed.")
         except Exception as e:
             logger.error(f"Auth Critical Failure: {e}")
-            self.token = None
 
     def _get_dynamic_query(self):
-        """Generates GraphQL query with a DYNAMIC timestamp (Last X Mins)."""
-        # Calculate time X minutes ago in ISO8601 format
         time_window = datetime.now(timezone.utc) - timedelta(minutes=Config.INTERVAL_MINUTES)
         time_str = time_window.strftime('%Y-%m-%dT%H:%M:%SZ')
 
@@ -75,7 +67,6 @@ class CryptoRadar:
               outputAddress: {{annotation: "Exchange"}}
             ) {{
               average: value(calculate: average)
-              count
             }}
             old_coins: inputs(age: {{gt: 1095}}, date: {{after: "{time_str}"}}) {{
               volume: value(calculate: sum)
@@ -85,78 +76,65 @@ class CryptoRadar:
         """
 
     def scan(self):
-        """Main Logic: Auth -> Query -> Analyze -> Alert"""
         self._refresh_token()
-        if not self.token:
-            logger.warning("Skipping scan due to missing token.")
-            return
+        if not self.token: return
 
         query = self._get_dynamic_query()
         headers = {"Authorization": f"Bearer {self.token}", "Content-Type": "application/json"}
 
         try:
-            # Using V2 streaming endpoint (check your specific API docs if using V1)
             res = requests.post("https://streaming.bitquery.io/graphql", json={"query": query}, headers=headers)
+            data = res.json()['data']['bitcoin']
             
-            if res.status_code != 200:
-                logger.error(f"Bitquery API Error: {res.text}")
-                return
-
-            json_data = res.json()
-            if 'errors' in json_data:
-                logger.error(f"GraphQL Error: {json_data['errors']}")
-                return
-
-            data = json_data['data']['bitcoin']
-            
-            # Safe parsing with defaults
             avg_inflow = data['inflow'][0]['average'] if data['inflow'] else 0.0
             old_vol = data['old_coins'][0]['volume'] if data['old_coins'] else 0.0
 
-            logger.info(f"Scan Result - Inflow Avg: {avg_inflow:.2f} | Old Vol: {old_vol:.2f}")
+            logger.info(f"Scan: Inflow {avg_inflow:.2f} | Old Vol {old_vol:.2f}")
 
-            # --- INTELLIGENT TRIGGER ---
-            # Using asyncio.run here is safe because APScheduler runs this in a thread
             if avg_inflow > 2.0 or old_vol > 100:
                 asyncio.run(self._send_alert(avg_inflow, old_vol))
-
         except Exception as e:
-            logger.error(f"Scan Runtime Error: {e}")
+            logger.error(f"Scan Error: {e}")
 
-    async def _send_alert(self, inflow, old_vol):
-        """Asynchronous Telegram Sender"""
-        msg = f"📡 **RADAR DETECTED MOVEMENT**\n"
-        msg += f"──────────────────────\n"
-        msg += f"📊 **Exchange Inflow (Avg):** {inflow:.2f} BTC\n"
+    async def _send_alert(self, inflow, old_vol, is_test=False):
+        prefix = "✅ **TEST MESSAGE**\n" if is_test else "📡 **RADAR ALERT**\n"
+        msg = f"{prefix}──────────────────────\n"
+        msg += f"📊 **Inflow Avg:** {inflow:.2f} BTC\n"
+        msg += f"⏳ **Old Coins:** {old_vol:.2f} BTC\n"
+        msg += f"──────────────────────"
         
-        if old_vol > 500:
-            msg += f"💀 **WHALE ALERT:** {old_vol:.0f} BTC (3y+ old) moved!\n"
-        elif old_vol > 0:
-            msg += f"⏳ **Old Coins:** {old_vol:.0f} BTC moved.\n"
-            
-        msg += f"──────────────────────\n"
-        
-        if inflow > 5.0:
-            msg += "🚨 **HIGH DUMP RISK** 🚨"
-        
-        try:
-            await self.bot.send_message(chat_id=Config.CHAT_ID, text=msg)
-            logger.info("Alert sent to Telegram.")
-        except Exception as e:
-            logger.error(f"Telegram Error: {e}")
+        await self.bot.send_message(chat_id=Config.CHAT_ID, text=msg, parse_mode='Markdown')
 
-# --- INIT ---
+# --- INITIALIZE ---
 radar = CryptoRadar()
+
+# --- ROUTES ---
+@app.route('/')
+def home():
+    return """
+    <div style="font-family:sans-serif; text-align:center; padding:50px;">
+        <h1>Radar 10000/10 📡</h1>
+        <p>Status: <b>Active and Scanning</b></p>
+        <hr style="width:200px">
+        <p>Confirm your Telegram credentials:</p>
+        <a href="/test"><button style="padding:10px 20px; background:#0088cc; color:white; border:none; border-radius:5px; cursor:pointer;">Send Test Message</button></a>
+    </div>
+    """
+
+@app.route('/test')
+def test_route():
+    try:
+        asyncio.run(radar._send_alert(0.0, 0.0, is_test=True))
+        return "<h3>Success! Check Telegram.</h3><a href='/'>Go Back</a>"
+    except Exception as e:
+        return f"<h3>Failed ❌</h3><p>{str(e)}</p><a href='/'>Go Back</a>"
+
+# --- SCHEDULER ---
 scheduler = BackgroundScheduler()
-# Run immediately on startup to check health, then every interval
 scheduler.add_job(func=radar.scan, trigger="interval", minutes=Config.INTERVAL_MINUTES)
 scheduler.start()
 
-@app.route('/')
-def health():
-    return "Radar 10000/10 is Active and Scanning... 📡"
-
 if __name__ == "__main__":
-    # Use PORT 10000 or whatever Render assigns
     port = int(os.environ.get("PORT", 10000))
     app.run(host="0.0.0.0", port=port)
+    
